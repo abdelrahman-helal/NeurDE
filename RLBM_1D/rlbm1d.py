@@ -155,6 +155,9 @@ def landau(N0, N3, T00, T03, T33):
     (the mixed tensor of collide.py with Ux = Uy = 0), eigenvector, n = U.N, T = eps/(3n)."""
     eps = 0.5 * ((T00 - T33) + torch.sqrt(torch.clamp((T00 + T33) ** 2 - 4 * T03 ** 2, min=0)))
     vz = T03 / (eps + T33)  # second eigenvector row; stable as T03 -> 0
+    # A physical f always gives |vz| < 1; guard against an unphysical f (e.g. from a bad
+    # learned equilibrium) producing U0 = 1/sqrt(negative) = NaN
+    vz = torch.clamp(vz, -1 + 1e-12, 1 - 1e-12)
     U0 = 1 / torch.sqrt(1 - vz ** 2)
     Uz = U0 * vz
     n = torch.clamp(U0 * N0 - Uz * N3, min=1e-30)
@@ -210,6 +213,14 @@ def poly_feq(st, n, U0, Uz, T):
                                   U0[None], torch.zeros_like(U0)[None], torch.zeros_like(U0)[None],
                                   Uz[None], (T / T0)[None])
     return st.w[:, None] * n[None] * expr / T0
+
+
+def reach_mask(n_cells, t_phys, mu_max, z_jump=3200):
+    """True where a run whose fastest direction is mu_max can have changed by physical
+    time t_phys: within mu_max * c * t of the initial jumps at z = +-z_jump (cells).
+    Beyond that only faster particles (e.g. the 128 set's) can have arrived."""
+    z = torch.arange(n_cells) - n_cells // 2
+    return (z.abs() - z_jump) <= mu_max * t_phys / DX
 
 
 def relL2(a, b):

@@ -93,19 +93,28 @@ def main():
         drift = ((tot - tot[0]).abs().amax(0) / tot[0, [0, 1, 1]].abs()).tolist()
         print(f"  {name:9s} drift of total N0, T00, T0z (rel. to N0, T00, T00): "
               + ", ".join(f"{x:.1e}" for x in drift))
+    mu_max = st.mu.abs().max().item()
     for t in times:
         ref = derived(*(data.target(k, t / R.DT_128) for k in ("n", "Uz", "T")))
-        print(f"\n== t = {t:g} fm/c" + "".join(f"   {k:>17s}" for k in FIELDS))
-        print(" " * 18 + "".join(f"   {'relL2 / max':>17s}" for _ in FIELDS))
+        # inside: cells the 16-node set can reach by time t; outside: only faster particles
+        # (the 128 set's) get there, so no equilibrium can change those errors
+        m = R.reach_mask(ref["n"].numel(), t, mu_max).to(ref["n"].device)
+        print(f"\n== t = {t:g} fm/c   (16-node reach: {m.sum().item()} of {m.numel()} cells)"
+              + "".join(f"   {k:>17s}" for k in FIELDS))
+        print(" " * 20 + "".join(f"   {'relL2 / max':>17s}" for _ in FIELDS))
         profiles = {"ref": ref}
         for name, (fields, _) in runs.items():
             prof = derived(*(R.interp_time(fields[k], t / st.dt) for k in ("n", "Uz", "T")))
             profiles[name] = prof
-            cells = []
-            for k in FIELDS:
-                d = prof[k] - ref[k]
-                cells.append(f"{R.relL2(prof[k], ref[k]):.1e} / {(d.abs().max() / ref[k].abs().max()):.1e}")
-            print(f"  {name:14s}" + "".join(f"   {c:>17s}" for c in cells))
+            for part, sel in (("inside", m), ("outside", ~m)):
+                if not sel.any():
+                    continue
+                cells = []
+                for k in FIELDS:
+                    a, b = prof[k][sel], ref[k][sel]
+                    # max error relative to the field's overall max, so both parts share a scale
+                    cells.append(f"{R.relL2(a, b):.1e} / {((a - b).abs().max() / ref[k].abs().max()):.1e}")
+                print(f"  {name + ' ' + part:18s}" + "".join(f"   {c:>17s}" for c in cells))
         for name, prof in profiles.items():
             for k in FIELDS:
                 saved[f"t{t:g}_{name}_{k}"] = prof[k].cpu().numpy()
@@ -119,6 +128,9 @@ def main():
             ax.plot(z, ref[k].cpu(), "k-", lw=2, label="128 run")
             for name in runs:
                 ax.plot(z, profiles[name][k].cpu(), "--", lw=1.2, label=f"{st.Q}-node {name}")
+            edge = 3200 + mu_max * t / R.DX  # end of the 16-node reach
+            for x in (-edge, edge):
+                ax.axvline(x, color="gray", ls=":", lw=1)
             ax.set_ylabel(k)
             ax.grid(alpha=0.3)
         axes[0].legend(fontsize=8)

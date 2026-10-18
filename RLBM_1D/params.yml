@@ -29,16 +29,17 @@ stage1:
   model_dir: checkpoints/stage1
 
 stage2:
-  epochs: 200           # one epoch = every training window once
+  epochs: 100           # one epoch = every training window once
+  patience: 20          # stop after this many epochs without validation improvement
   rollout: 25           # 16-node steps per window
   detach_every: 1       # cut the gradient through time every N steps (NeurDE: 1)
-  lr: 1.0e-5
+  lr: 1.0e-5            # (OneCycleLR starts at max_lr / div_factor instead)
   scheduler: OneCycleLR
   scheduler_config:
-    max_lr: 1.0e-4
+    max_lr: 2.0e-5      # was 1e-4: training destabilized above ~2.5e-5
     pct_start: 0.3
-    div_factor: 10
-    final_div_factor: 100
+    div_factor: 2       # start at 1e-5
+    final_div_factor: 10
   loss_weights:
     n: 1.0
     Uz: 1.0
