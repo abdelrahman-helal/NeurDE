@@ -29,8 +29,8 @@ stage1:
   model_dir: checkpoints/stage1
 
 stage2:
-  epochs: 100           # one epoch = every training window once
-  patience: 20          # stop after this many epochs without validation improvement
+  epochs: 100           # one epoch = every training window once; all epochs run (no early stopping)
+  keep_top: 3           # checkpoints kept with the lowest validation loss (NeurDE: 3)
   rollout: 25           # 16-node steps per window
   detach_every: 1       # cut the gradient through time every N steps (NeurDE: 1)
   lr: 1.0e-5            # (OneCycleLR starts at max_lr / div_factor instead)

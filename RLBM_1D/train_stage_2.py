@@ -13,6 +13,11 @@ no equilibrium can change anything, so those cells are left out.
 Gradients reach the network through the collision of the same step; the state is
 detached every `detach_every` steps (NeurDE: every step).
 
+As in NeurDE, training runs every epoch (no early stopping) and keeps the `keep_top`
+checkpoints with the lowest validation loss; best.pt is the lowest of them. The
+Stage 1 model (epoch 0) competes too, so best.pt is never worse than it. The
+classical 16-node solver's loss on the validation windows is logged as the baseline.
+
 Usage: python train_stage_2.py --init checkpoints/stage1/best.pt [--params params.yml]
 """
 
@@ -61,13 +66,23 @@ def step_network(model, f, st):
     return R.stream(R.collide(f, feq, U0, Uz, R.tau(n, T, st.v0), st), st)
 
 
-def rollout_loss(model, data, k, st, rollout, weights, detach_every):
+def step_classical(f, st):
+    """One 16-node step with the classical equilibrium: exact U from the moments and
+    Alessandro's FEQ polynomial (the RLBM_STENCIL=16 run of relativistic_hydrodynamics)."""
+    mom = R.moments(f, st)
+    U0, Uz, n, T = R.landau(*mom)
+    feq = R.poly_feq(st, n, U0, Uz, T)
+    return R.stream(R.collide(f, feq, U0, Uz, R.tau(n, T, st.v0), st), st)
+
+
+def rollout_loss(step, data, k, st, rollout, weights, detach_every):
+    """Mean loss over one window; `step` maps a state to the next one."""
     f = data.f_init[k]
     i0 = data.init_steps[k]
     mu_max = st.mu.abs().max().item()
     total = 0.0
     for s in range(1, rollout + 1):
-        f = step_network(model, f, st)
+        f = step(f)
         _, Uz, n, T = R.landau(*R.moments(f, st))
         t = i0 + s * data.ratio
         m = R.reach_mask(n.numel(), t * R.DT_128, mu_max).to(n.device)
@@ -115,25 +130,46 @@ def main():
     model_dir = os.path.join(R.HERE, c2["model_dir"])
     os.makedirs(model_dir, exist_ok=True)
     log = csv.writer(open(os.path.join(model_dir, "log.csv"), "w", newline=""))
-    log.writerow(["epoch", "train_loss", "val_loss", "lr", "seconds", "skipped_windows"])
-    # Epoch 0: the Stage 1 model before any Stage 2 training (the number to beat).
-    # best.pt starts as this model, so Stage 2 can only replace it with something better.
+    log.writerow(["epoch", "train_loss", "val_loss", "classical_val_loss", "lr", "seconds", "skipped_windows"])
+
+    def val_loss(step):
+        with torch.no_grad():
+            return float(np.mean([rollout_loss(step, data, k, st, rollout, c2["loss_weights"], 1).item()
+                                  for k in val_w])) if val_w else math.nan
+
+    keep_top = c2.get("keep_top", 3)
+    top = []  # (score, epoch, path), lowest score first
+
+    def keep_if_top(score, epoch):
+        """NeurDE's top-k checkpoints by validation loss; best.pt is the lowest."""
+        if not math.isfinite(score) or (len(top) == keep_top and score >= top[-1][0]):
+            return
+        state = {"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": score}
+        path = os.path.join(model_dir, f"top_epoch{epoch:04d}.pt")
+        torch.save(state, path)
+        top.append((score, epoch, path))
+        top.sort()
+        while len(top) > keep_top:
+            os.remove(top.pop()[2])
+        if top[0][1] == epoch:
+            torch.save(state, os.path.join(model_dir, "best.pt"))
+
+    # Epoch 0: the classical solver (baseline) and the Stage 1 model before any Stage 2
+    # training. The Stage 1 model is a checkpoint candidate like any later epoch.
+    classical_val = val_loss(lambda f: step_classical(f, st))
     model.eval()
-    with torch.no_grad():
-        val0 = float(np.mean([rollout_loss(model, data, k, st, rollout, c2["loss_weights"], 1).item()
-                              for k in val_w])) if val_w else math.nan
+    val0 = val_loss(lambda f: step_network(model, f, st))
+    print(f"classical 16-node solver: val {classical_val:.3e}  (baseline)", flush=True)
     print(f"epoch    0  val {val0:.3e}  (Stage 1 model, before Stage 2)", flush=True)
-    log.writerow([0, math.nan, val0, optimizer.param_groups[0]["lr"], 0.0, 0])
-    best = val0 if math.isfinite(val0) else math.inf
-    torch.save({"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": 0, "val": val0},
-               os.path.join(model_dir, "best.pt"))
-    since_best = 0
+    log.writerow([0, math.nan, val0, classical_val, optimizer.param_groups[0]["lr"], 0.0, 0])
+    keep_if_top(val0 if val_w else math.inf, 0)
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         model.train()
         run, skipped = 0.0, 0
         for k in np.random.permutation(train_w):
-            l = rollout_loss(model, data, k, st, rollout, c2["loss_weights"], c2["detach_every"])
+            l = rollout_loss(lambda f: step_network(model, f, st), data, k, st, rollout,
+                             c2["loss_weights"], c2["detach_every"])
             optimizer.zero_grad()
             if not torch.isfinite(l):  # a NaN/inf update would turn every weight into NaN
                 skipped += 1
@@ -150,26 +186,18 @@ def main():
             scheduler.step()
             run += l.item()
         model.eval()
-        with torch.no_grad():
-            val = float(np.mean([rollout_loss(model, data, k, st, rollout, c2["loss_weights"], 1).item()
-                                 for k in val_w])) if val_w else math.nan
+        val = val_loss(lambda f: step_network(model, f, st))
         train = run / max(len(train_w) - skipped, 1)
-        log.writerow([epoch, train, val, optimizer.param_groups[0]["lr"], time.time() - t0, skipped])
+        log.writerow([epoch, train, val, classical_val, optimizer.param_groups[0]["lr"], time.time() - t0, skipped])
         print(f"epoch {epoch:4d}  train {train:.3e}  val {val:.3e}  skipped {skipped}/{len(train_w)}"
               f"  lr {optimizer.param_groups[0]['lr']:.1e}  ({time.time() - t0:.0f}s)", flush=True)
-        state = {"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": val}
-        torch.save(state, os.path.join(model_dir, "last.pt"))
-        # best.pt: lowest finite validation loss (training loss if there is no validation)
-        score = val if val_w else train
-        if math.isfinite(score) and score < best:
-            best, since_best = score, 0
-            torch.save(state, os.path.join(model_dir, "best.pt"))
-        else:
-            since_best += 1
-            if since_best >= c2.get("patience", 20):
-                print(f"stopping: no validation improvement for {since_best} epochs", flush=True)
-                break
-    print(f"best validation loss {best:.3e}; checkpoints in {model_dir}")
+        torch.save({"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": val},
+                   os.path.join(model_dir, "last.pt"))
+        # ranked by validation loss (training loss if there is no validation)
+        keep_if_top(val if val_w else train, epoch)
+    print(f"top {len(top)} by validation loss: "
+          + ", ".join(f"epoch {e} ({s:.3e})" for s, e, _ in top)
+          + f"; classical baseline {classical_val:.3e}; checkpoints in {model_dir}")
 
 
 if __name__ == "__main__":

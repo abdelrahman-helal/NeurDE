@@ -25,7 +25,7 @@ import yaml
 
 import rlbm1d as R
 from model import NeurDE1D
-from train_stage_2 import Stage2Data, step_network
+from train_stage_2 import Stage2Data, step_classical, step_network
 
 FIELDS = ("n", "eps", "T", "P", "Uz")
 
@@ -73,12 +73,7 @@ def main():
 
     runs = {}
     if args.classical:
-        def classical(f):
-            mom = R.moments(f, st)
-            U0, Uz, n, T = R.landau(*mom)
-            feq = R.poly_feq(st, n, U0, Uz, T)
-            return R.stream(R.collide(f, feq, U0, Uz, R.tau(n, T, st.v0), st), st)
-        runs["classical"] = rollout(classical, data.f_init[k0], st, n_steps)
+        runs["classical"] = rollout(lambda f: step_classical(f, st), data.f_init[k0], st, n_steps)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=args.device)
         model = NeurDE1D(**ckpt["cfg"]["model"]).to(args.device, dtype)
