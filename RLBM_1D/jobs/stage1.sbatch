@@ -9,4 +9,4 @@
 #SBATCH -t 04:00:00
 #SBATCH -o logs/%x-%j.out
 source jobs/common.sh
-srun python train_stage_1.py
+srun python train_stage_1.py "$@"

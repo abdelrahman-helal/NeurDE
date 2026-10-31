@@ -174,6 +174,19 @@ Start from the best Stage 1 model. Use NeurDE's Stage 2 settings (OneCycleLR, ab
 - Step 0 (extra runs) is postponed: training starts on the single run, split in time.
 - `test_solver1d.py`: the torch 1D solver reproduces Alessandro's 16- and 24-node runs to 1e-15.
 
+## Changes (2026-10-31)
+
+These replace the corresponding parts of steps 4–6 above.
+
+- **No `v_z` head.** The network outputs f_eq only. As in NeurDE, U, n and T come from the state's own moments (closed-form `landau()`), before the network runs.
+- **Stage 1 loss = NeurDE's:** relative error on f against `Feq16` only (no degree-3 term, no `v_z` term).
+- **Optional x/y moment inputs** (`train_stage_1.py --xy-moments`). The 128 run has 8 entries a reduced set cannot hold: Nˣ, Nʸ, T⁰ˣ, T⁰ʸ, Tˣʸ, Tˣᶻ, Tʸᶻ, Tˣˣ − Tʸʸ (stored as `moments_xy` by `make_dataset.py`). With the flag, the network input is the 4 t/z features plus these 8 (divided by N0):
+  - Stage 1 feeds the 128 run's true values.
+  - Stage 2 and eval feed estimates from `MomentMLP` (`train_moment_mlp.py`), trained on the 128 run to map the 4 t/z features to the 8. It is frozen and stored in every Stage 2 checkpoint.
+  - `train_moment_mlp.py` logs each output's validation RMSE against predicting zero; a ratio near 1 means that entry is not predictable from the t/z features.
+  - Accepted trade-off: Stage 2 starts on estimated inputs where Stage 1 saw true values.
+- Order with the flag: `make_dataset.py` → `train_moment_mlp.py` → `train_stage_1.py --xy-moments` → `train_stage_2.py` → `eval.py`.
+
 ## Order and gates
 
 1. **Step 0** (data runs) and **step 1** (solver) can go in parallel.

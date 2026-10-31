@@ -137,6 +137,65 @@ class EntropicFit:
         return lam
 
 
+class EntropicFitTorch:
+    """EntropicFit as batched torch (GPU) Newton iterations, for targets computed during
+    training. Same family and basis as EntropicFit; warm-start lam from the previous
+    time step and it converges in a few iterations."""
+
+    def __init__(self, st, kb):
+        ref = EntropicFit(st.np["p0"], st.np["pz"], st.np["w"], kb)
+        t = lambda a: torch.tensor(a, dtype=st.w.dtype, device=st.w.device)
+        self.C, self.phi, self.A, self.w, self.r = t(ref.C), t(ref.phi), t(ref.A), st.w, ref.r
+        self.alphas = 0.5 ** torch.arange(0, 25, dtype=st.w.dtype, device=st.w.device)
+
+    def f(self, lam):
+        return self.w * torch.exp(torch.clamp(lam @ self.phi, -700, 700))
+
+    @torch.no_grad()
+    def solve(self, M, lead, lam0=None, iters=50, tol=1e-10):
+        """M, lead: (r, S). Returns f (S, Q), lam (S, r), converged (S,)."""
+        Tg = (self.C @ M).T
+        if lam0 is None:
+            lam = torch.zeros_like(Tg)
+            lam[:, 0] = torch.log(Tg[:, 0].clamp(min=1e-300))
+        else:
+            lam = lam0.clone()
+        eye = torch.eye(self.r, dtype=M.dtype, device=M.device)
+        for _ in range(iters):
+            f = self.f(lam)
+            if ((f @ self.A.T - M.T).abs() / lead.T).max() < tol:
+                break
+            g = f @ self.phi.T - Tg
+            H = torch.einsum("si,ai,bi->sab", f, self.phi, self.phi)
+            H = H + 1e-14 * torch.einsum("saa->s", H)[:, None, None] * eye
+            step = torch.linalg.solve(H, g.unsqueeze(-1)).squeeze(-1)
+            L0 = f.sum(1) - (lam * Tg).sum(1)
+            slope = (g * step).sum(1)
+            trial = lam[None] - self.alphas[:, None, None] * step[None]          # (A, S, r)
+            L1 = self.f(trial).sum(-1) - (trial * Tg[None]).sum(-1)               # (A, S)
+            ok = L1 <= L0[None] - 1e-4 * self.alphas[:, None] * slope[None] + 1e-15 * L0.abs()[None]
+            first = ok.float().argmax(0)                                          # largest accepted step
+            moved = ok.any(0)
+            lam = torch.where(moved[:, None], trial[first, torch.arange(lam.shape[0])], lam)
+        f = self.f(lam)
+        conv = ((f @ self.A.T - M.T).abs() / lead.T).amax(1) < 1e-8
+        return f, lam, conv
+
+
+def mj_moments(n, U0, Uz, T, kb, n_mu=64):
+    """Exact Maxwell-Juttner moments sum_i f_i p0^(k-b) pz^b, i.e. int d3p/p0 p0^(k-b) pz^b f,
+    for f = n/(8 pi T^3) exp(-p.U/T) with Ux = Uy = 0 (code units, same convention as the
+    128 run: N^0 = n U0). Energy integral in closed form, angle by Gauss-Legendre.
+    Inputs (S,); returns (len(kb), S)."""
+    mu, wm = np.polynomial.legendre.leggauss(n_mu)
+    mu = torch.tensor(mu, dtype=n.dtype, device=n.device)[:, None]
+    wm = torch.tensor(wm, dtype=n.dtype, device=n.device)[:, None]
+    a = (U0[None] - Uz[None] * mu) / T[None]                                       # (n_mu, S)
+    A = n / (8 * math.pi * T ** 3)
+    return torch.stack([A * math.factorial(k + 1) * 2 * math.pi * (wm * mu ** b * a ** (-(k + 2))).sum(0)
+                        for k, b in kb])
+
+
 # ------------------------------------------------------------------- 1D solver
 
 def moments(f, st):
@@ -148,6 +207,12 @@ def moments(f, st):
 def features(N0, N3, T00, T03, T33):
     """Network input: the 1D moments divided by N0 (f_eq scales linearly with N0)."""
     return torch.stack([N3 / N0, T00 / N0, T03 / N0, T33 / N0], dim=1)
+
+
+def xy_features(moments_xy, N0):
+    """The 8 entries a reduced set cannot hold (N1, N2, T01, T02, T12, T13, T23, T11 - T22;
+    make_dataset.py), divided by N0 like features(). moments_xy: (S, 8)."""
+    return moments_xy / N0[:, None]
 
 
 def landau(N0, N3, T00, T03, T33):

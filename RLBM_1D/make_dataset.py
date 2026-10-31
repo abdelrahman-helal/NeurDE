@@ -3,6 +3,8 @@ Build the NeurDE training data from the 128-velocity run (TRAINING_PLAN.md, step
 
 Stage 1 (data/stage1.h5), one row per sampled site and step:
   moments  (S, 5)  N0, N3, T00, T03, T33 of the 128 run's f (the network input)
+  moments_xy (S, 8) N1, N2, T01, T02, T12, T13, T23, T11 - T22 of the same f: the
+                   entries a reduced (ring) set cannot hold (train_stage_1.py --xy-moments)
   Mref     (S, 10) the 128 run's f_eq moments of degree <= 3 (p0^(k-b) pz^b, code units)
   lead     (S, 4)  sum |feq| p0^k, k = 0..3 (scale of a degree-k moment)
   Feq16    (S, Q)  positive entropic f_eq on the reduced set matching Mref's degree <= 2
@@ -60,7 +62,7 @@ def main():
     fit = R.EntropicFit(st.np["p0"], st.np["pz"], st.np["w"], kb2)
     lead_of = lambda g: np.stack([(np.abs(g) * p0_128[:, None] ** k).sum(0) for k in range(4)])
 
-    rows = {k: [] for k in ("moments", "Mref", "lead", "vz", "n", "T", "noneq", "step")}
+    rows = {k: [] for k in ("moments", "moments_xy", "Mref", "lead", "vz", "n", "T", "noneq", "step")}
     inits, init_steps, init_conv = [], [], []
     with h5py.File(args.h5, "r") as h:
         n_steps = h["feq"].shape[0] if args.max_steps is None else args.max_steps
@@ -81,6 +83,8 @@ def main():
                 eq_idx = rng.choice(eq_idx, args.eq_per_step, replace=False)
             idx = np.sort(np.concatenate([noneq_idx, eq_idx]))
             rows["moments"].append(np.stack([N[0], N[3], Tm[0], Tm[3], Tm[9]])[:, idx])
+            rows["moments_xy"].append(np.stack([N[1], N[2], Tm[1], Tm[2], Tm[5], Tm[6], Tm[8],
+                                                Tm[4] - Tm[7]])[:, idx])
             rows["Mref"].append(A128 @ feq[:, idx])
             rows["lead"].append(lead_of(feq[:, idx]))
             rows["vz"].append(fields["Uz"][t, idx] / fields["U0"][t, idx])
@@ -117,7 +121,7 @@ def main():
           f"{np.mean(init_conv):.4%} of sites (rest fall back to f_eq moments)")
 
     with h5py.File(os.path.join(args.out_dir, "stage1.h5"), "w") as o:
-        for k in ("moments", "Mref", "lead"):
+        for k in ("moments", "moments_xy", "Mref", "lead"):
             o.create_dataset(k, data=data[k].T)
         o.create_dataset("Feq16", data=Feq16.T)
         o.create_dataset("lam", data=lam)

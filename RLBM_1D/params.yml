@@ -22,11 +22,22 @@ stage1:
     T_0_epochs: 50      # first restart after this many epochs (converted to batches)
     T_mult: 2
     eta_min: 1.0e-6
-  loss_weights:
-    f: 1.0              # main term: NeurDE's relative L2 error on f against the 16-node target Feq16
-    moment3: 0.1        # added term: relative L2 of the degree-3 moments against the 128 run
-    vz: 1.0             # mean squared error of vz = Uz/U0
+  # loss: NeurDE's relative L2 error on f against the 16-node target Feq16 (nothing else)
   model_dir: checkpoints/stage1
+
+moment_mlp:             # train_moment_mlp.py: the 8 x/y features from the 4 t/z features
+  hidden: 64
+  layers: 4
+  activation: relu
+  epochs: 100
+  batch_size: 4096
+  lr: 1.0e-3
+  scheduler: CosineAnnealingWarmRestarts
+  scheduler_config:
+    T_0_epochs: 50
+    T_mult: 2
+    eta_min: 1.0e-6
+  model_dir: checkpoints/moment_mlp
 
 stage2:
   epochs: 100           # one epoch = every training window once; all epochs run (no early stopping)
@@ -45,3 +56,20 @@ stage2:
     Uz: 1.0
     T: 1.0
   model_dir: checkpoints/stage2
+
+stage2_eq:              # NeurDE-style Stage 2 (train_stage_2_eq.py): equilibrium loss on rollout states
+  epochs: 100
+  patience: 20
+  rollout: 25
+  lr: 1.0e-5            # (OneCycleLR starts at max_lr / div_factor instead)
+  scheduler: OneCycleLR
+  scheduler_config:
+    max_lr: 1.0e-4      # the loss is local per step like Stage 1, so it is far more stable than stage2
+    pct_start: 0.3
+    div_factor: 10
+    final_div_factor: 100
+  loss_weights:         # same terms as Stage 1
+    f: 1.0
+    moment3: 0.1
+    vz: 1.0
+  model_dir: checkpoints/stage2_eq
