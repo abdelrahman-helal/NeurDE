@@ -25,7 +25,7 @@ import yaml
 
 import rlbm1d as R
 from model import NeurDE1D
-from train_stage_2 import Stage2Data, step_classical, step_network
+from rollout import Stage2Data, load_moment_mlp, step_classical, step_network
 
 FIELDS = ("n", "eps", "T", "P", "Uz")
 
@@ -54,6 +54,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--classical", action="store_true")
+    ap.add_argument("--moment-mlp", default=os.path.join(R.HERE, "checkpoints", "moment_mlp", "best.pt"),
+                    help="MomentMLP for a model with x/y moment inputs whose checkpoint does not carry it (Stage 1)")
     ap.add_argument("--params", default=os.path.join(R.HERE, "params.yml"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--times", type=float, nargs="+", default=[0.8, 1.6, 2.4, 3.19],
@@ -79,7 +81,11 @@ def main():
         model = NeurDE1D(**ckpt["cfg"]["model"]).to(args.device, dtype)
         model.load_state_dict(ckpt["model"])
         model.eval()
-        runs["network"] = rollout(lambda f: step_network(model, f, st), data.f_init[k0], st, n_steps)
+        mlp = None
+        if ckpt["cfg"]["model"].get("n_in", 4) == 12:  # Stage 2 checkpoints carry the MLP; Stage 1 ones don't
+            mlp_state = ckpt.get("moment_mlp") or torch.load(args.moment_mlp, map_location=args.device)
+            mlp = load_moment_mlp(mlp_state, args.device, dtype)
+        runs["network"] = rollout(lambda f: step_network(model, f, st, mlp), data.f_init[k0], st, n_steps)
 
     os.makedirs(args.out, exist_ok=True)
     saved = {}

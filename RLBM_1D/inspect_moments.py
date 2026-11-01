@@ -32,7 +32,7 @@ import yaml  # noqa: E402
 
 import rlbm1d as R  # noqa: E402
 from stencil import Stencil  # noqa: E402  (relativistic_hydrodynamics)
-from train_stage_2 import Stage2Data, step_classical  # noqa: E402
+from rollout import Stage2Data, step_classical  # noqa: E402
 
 NAMES = ("t", "x", "y", "z")
 KB3 = [(3, b) for b in range(4)]  # p0^3, p0^2 pz, p0 pz^2, pz^3
