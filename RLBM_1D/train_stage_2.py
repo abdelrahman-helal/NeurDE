@@ -4,8 +4,12 @@ Stage 2: train NeurDE1D inside the 16-node solver against the 128-velocity run
 
 Each window starts from a stored 16-node state (make_dataset.py, stage2.h5) and runs
 `rollout` steps. One step:
-  moments -> network (feq_hat, vz) -> f_eq = N0 feq_hat, U = gamma (1, vz) -> conservation
-  projection -> n, T, tau -> Anderson-Witting collision -> streaming
+  moments -> U, n, T (exact Landau frame of the state, as in NeurDE and the classical
+  solver) -> network -> f_eq = N0 feq_hat -> conservation projection -> tau ->
+  Anderson-Witting collision -> streaming
+If the Stage 1 model takes the 8 x/y moment features (train_stage_1.py --xy-moments),
+the frozen MomentMLP (train_moment_mlp.py) estimates them from the 4 t/z features; it
+is stored in every Stage 2 checkpoint.
 The loss compares n, Uz, T of the new state (exact Landau frame of its moments) with
 the 128 run at the same physical time (linear interpolation between stored steps), on
 the cells the 16-node set can reach (rlbm1d.reach_mask): beyond its fastest direction
@@ -27,52 +31,14 @@ import math
 import os
 import time
 
-import h5py
 import numpy as np
 import torch
 import yaml
 
 import rlbm1d as R
 from model import NeurDE1D
+from rollout import Stage2Data, load_moment_mlp, step_classical, step_network
 from utilities import dispatch_optimizer, get_scheduler, set_seed  # NeurDE/SOD_shock_tube
-
-
-class Stage2Data:
-    def __init__(self, path, device, dtype):
-        with h5py.File(path, "r") as h:
-            self.f_init = torch.tensor(h["f16_init"][:], device=device, dtype=dtype)
-            self.init_steps = h["init_steps"][:]
-            self.fields = {k: torch.tensor(h[k][:], device=device, dtype=dtype) for k in ("n", "U0", "Uz", "T")}
-            self.ratio = h.attrs["dt16"] / h.attrs["dt128"]  # 128-run steps per 16-node step
-        self.n_steps = self.fields["n"].shape[0]
-
-    def windows(self, rollout, lo, hi):
-        """Starting states whose whole window lies inside 128-run steps [lo, hi]."""
-        span = rollout * self.ratio
-        return [k for k, i0 in enumerate(self.init_steps) if i0 >= lo and i0 + span <= hi]
-
-    def target(self, name, t_index):
-        return R.interp_time(self.fields[name], t_index)
-
-
-def step_network(model, f, st):
-    """One 16-node step with the network equilibrium. Returns the new state."""
-    mom = R.moments(f, st)
-    feq_hat, vz = model(R.features(*mom), st.basis)  # feq_hat = f_eq / N0
-    U0 = 1 / torch.sqrt(1 - vz ** 2)
-    Uz = U0 * vz
-    feq = R.project_conservation(mom[0][None] * feq_hat.T, U0, Uz, *mom, st)
-    n, _, T = R.n_eps_T(U0, Uz, *mom)
-    return R.stream(R.collide(f, feq, U0, Uz, R.tau(n, T, st.v0), st), st)
-
-
-def step_classical(f, st):
-    """One 16-node step with the classical equilibrium: exact U from the moments and
-    Alessandro's FEQ polynomial (the RLBM_STENCIL=16 run of relativistic_hydrodynamics)."""
-    mom = R.moments(f, st)
-    U0, Uz, n, T = R.landau(*mom)
-    feq = R.poly_feq(st, n, U0, Uz, T)
-    return R.stream(R.collide(f, feq, U0, Uz, R.tau(n, T, st.v0), st), st)
 
 
 def rollout_loss(step, data, k, st, rollout, weights, detach_every):
@@ -97,6 +63,8 @@ def rollout_loss(step, data, k, st, rollout, weights, detach_every):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--init", required=True, help="Stage 1 checkpoint")
+    ap.add_argument("--moment-mlp", default=os.path.join(R.HERE, "checkpoints", "moment_mlp", "best.pt"),
+                    help="MomentMLP checkpoint, used when the Stage 1 model takes the x/y moment features")
     ap.add_argument("--params", default=os.path.join(R.HERE, "params.yml"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--epochs", type=int, default=None)
@@ -124,6 +92,13 @@ def main():
     ckpt = torch.load(args.init, map_location=args.device)
     model = NeurDE1D(**ckpt["cfg"]["model"]).to(args.device, dtype)
     model.load_state_dict(ckpt["model"])
+    mlp, extra = None, {}
+    if ckpt["cfg"]["model"].get("n_in", 4) == 12:
+        mlp_state = ckpt.get("moment_mlp") or torch.load(args.moment_mlp, map_location=args.device)
+        mlp = load_moment_mlp(mlp_state, args.device, dtype)
+        extra = {"moment_mlp": mlp_state}  # stored with every checkpoint, so eval needs no path
+        print(f"x/y moment features from the frozen MomentMLP (epoch {mlp_state.get('epoch')})")
+    net_step = lambda f: step_network(model, f, st, mlp)
     optimizer = dispatch_optimizer(model, lr=c2["lr"], optimizer_type="AdamW")
     scheduler = get_scheduler(optimizer, c2["scheduler"], epochs * len(train_w), c2.get("scheduler_config", {}))
 
@@ -144,7 +119,7 @@ def main():
         """NeurDE's top-k checkpoints by validation loss; best.pt is the lowest."""
         if not math.isfinite(score) or (len(top) == keep_top and score >= top[-1][0]):
             return
-        state = {"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": score}
+        state = {"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": score, **extra}
         path = os.path.join(model_dir, f"top_epoch{epoch:04d}.pt")
         torch.save(state, path)
         top.append((score, epoch, path))
@@ -158,7 +133,7 @@ def main():
     # training. The Stage 1 model is a checkpoint candidate like any later epoch.
     classical_val = val_loss(lambda f: step_classical(f, st))
     model.eval()
-    val0 = val_loss(lambda f: step_network(model, f, st))
+    val0 = val_loss(net_step)
     print(f"classical 16-node solver: val {classical_val:.3e}  (baseline)", flush=True)
     print(f"epoch    0  val {val0:.3e}  (Stage 1 model, before Stage 2)", flush=True)
     log.writerow([0, math.nan, val0, classical_val, optimizer.param_groups[0]["lr"], 0.0, 0])
@@ -168,8 +143,7 @@ def main():
         model.train()
         run, skipped = 0.0, 0
         for k in np.random.permutation(train_w):
-            l = rollout_loss(lambda f: step_network(model, f, st), data, k, st, rollout,
-                             c2["loss_weights"], c2["detach_every"])
+            l = rollout_loss(net_step, data, k, st, rollout, c2["loss_weights"], c2["detach_every"])
             optimizer.zero_grad()
             if not torch.isfinite(l):  # a NaN/inf update would turn every weight into NaN
                 skipped += 1
@@ -186,12 +160,12 @@ def main():
             scheduler.step()
             run += l.item()
         model.eval()
-        val = val_loss(lambda f: step_network(model, f, st))
+        val = val_loss(net_step)
         train = run / max(len(train_w) - skipped, 1)
         log.writerow([epoch, train, val, classical_val, optimizer.param_groups[0]["lr"], time.time() - t0, skipped])
         print(f"epoch {epoch:4d}  train {train:.3e}  val {val:.3e}  skipped {skipped}/{len(train_w)}"
               f"  lr {optimizer.param_groups[0]['lr']:.1e}  ({time.time() - t0:.0f}s)", flush=True)
-        torch.save({"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": val},
+        torch.save({"model": model.state_dict(), "cfg": ckpt["cfg"], "epoch": epoch, "val": val, **extra},
                    os.path.join(model_dir, "last.pt"))
         # ranked by validation loss (training loss if there is no validation)
         keep_if_top(val if val_w else train, epoch)
